@@ -1,0 +1,7 @@
+data/*.sqlite-wal
+data/*.sqlite-shm
+exports/
+node_modules/
+npm-debug.log
+.git/
+.gitignore

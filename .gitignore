@@ -1,0 +1,17 @@
+# Dependencies and local runtime data
+node_modules/
+/data/
+/exports/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Editor and operating system files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

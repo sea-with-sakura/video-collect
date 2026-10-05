@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Video Collect</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="数据源">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">VC</div>
+          <div>
+            <h1>Video Collect</h1>
+            <p>Resource Index</p>
+          </div>
+        </div>
+        <div class="sidebar-section nav-section">
+          <h2>Workspace</h2>
+          <nav class="workspace-nav" aria-label="Workspace navigation">
+            <button class="workspace-button active" type="button" data-view-button="index">
+              <span class="nav-icon" aria-hidden="true">+</span>
+              <span>
+                <strong>索引工作台</strong>
+                <em>采集与生成索引</em>
+              </span>
+            </button>
+            <button class="workspace-button" type="button" data-view-button="search">
+              <span class="nav-icon" aria-hidden="true">⌕</span>
+              <span>
+                <strong>索引查询</strong>
+                <em>检索已保存资源</em>
+              </span>
+            </button>
+          </nav>
+        </div>
+        <div class="sidebar-section provider-section">
+          <h2>Providers</h2>
+          <nav class="source-nav" id="providerList" aria-label="Provider list"></nav>
+        </div>
+        <div class="sidebar-section" data-index-only>
+          <h2>Pipeline</h2>
+          <ol class="pipeline">
+            <li class="active">Parse</li>
+            <li>Collect</li>
+            <li>Normalize</li>
+            <li>Persist</li>
+          </ol>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="header-bar" data-index-only>
+          <div>
+            <p class="eyebrow">Index Workspace</p>
+            <h2>资源索引工作台</h2>
+            <p class="page-subtitle">从分享链接、批量文本或 CSV 文件中解析资源，并生成可检索索引。</p>
+          </div>
+          <div class="header-actions">
+            <span class="status-pill" id="apiStatus">Checking</span>
+            <div class="library-count">
+              <span>索引库总条目</span>
+              <strong id="metricStored">0</strong>
+            </div>
+            <button class="icon-button" id="moreActions" type="button" title="更多操作" aria-label="更多操作">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm6 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm6 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="task-card" aria-labelledby="collectorTitle" data-index-only>
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Create Task</p>
+              <h3 id="collectorTitle">创建索引任务</h3>
+            </div>
+          </div>
+
+          <form id="collectorForm">
+            <div class="settings-strip">
+              <label class="field setting-number">
+                <span>并发数</span>
+                <input id="batchConcurrency" type="number" min="1" max="8" value="3" />
+              </label>
+              <label class="permission-check compact-permission">
+                <input id="confirmAuthorized" name="confirmAuthorized" type="checkbox" />
+                <span>我确认仅索引本人拥有权限或公开授权的资源</span>
+              </label>
+              <fieldset class="radio-field save-mode">
+                <legend>结果处理</legend>
+                <label><input type="radio" name="saveMode" value="preview" /> 仅本次预览</label>
+                <label><input type="radio" name="saveMode" value="save" checked /> 保存结果到索引库</label>
+              </fieldset>
+            </div>
+
+            <div class="task-tabs" role="tablist" aria-label="索引入口">
+              <button class="tab-button active" id="tabSingle" type="button" data-tab="single" role="tab" aria-selected="true">单链接采集</button>
+              <button class="tab-button" id="tabBatch" type="button" data-tab="batch" role="tab" aria-selected="false">批量解析链接</button>
+              <button class="tab-button" id="tabCsv" type="button" data-tab="csv" role="tab" aria-selected="false">从 CSV 导入索引</button>
+            </div>
+
+            <div class="tab-panel active" id="panelSingle" data-panel="single" role="tabpanel" aria-labelledby="tabSingle">
+              <div class="form-grid single-grid">
+                <label class="field field-wide">
+                  <span>分享链接</span>
+                  <input id="shareUrl" name="shareUrl" type="url" placeholder="请输入分享链接，例如：https://pan.quark.cn/s/xxxx" autocomplete="off" />
+                </label>
+                <label class="field passcode-field">
+                  <span>提取码</span>
+                  <input id="passcode" name="passcode" type="text" placeholder="可选" autocomplete="off" />
+                </label>
+              </div>
+              <details class="advanced-settings">
+                <summary>高级设置</summary>
+                <div class="advanced-grid">
+                  <label class="field">
+                    <span>递归深度</span>
+                    <input id="maxDepth" name="maxDepth" type="number" min="0" max="12" value="0" />
+                  </label>
+                  <label class="switch-field">
+                    <input id="recursive" name="recursive" type="checkbox" checked />
+                    <span>递归目录</span>
+                  </label>
+                </div>
+              </details>
+              <div class="task-actions">
+                <button class="primary-button" id="collectButton" type="submit" disabled>开始解析并生成索引</button>
+                <button class="ghost-button" id="parseButton" type="button">解析链接</button>
+                <button class="danger-button" id="stopTaskButton" type="button" hidden>停止任务</button>
+              </div>
+              <div class="hint-text" id="permissionHint">请先确认你拥有索引该资源的权限。</div>
+            </div>
+
+            <div class="tab-panel" id="panelBatch" data-panel="batch" role="tabpanel" aria-labelledby="tabBatch">
+              <label class="field">
+                <span>批量分享链接</span>
+                <textarea id="batchLinks" rows="8" placeholder="每行输入一个分享链接，也支持用空格、逗号或换行分隔。"></textarea>
+              </label>
+              <details class="advanced-settings">
+                <summary>高级设置</summary>
+                <div class="advanced-note">批量任务默认使用递归深度 12，并受上方并发数控制。</div>
+              </details>
+              <div class="task-actions">
+                <button class="primary-button" id="batchCollectButton" type="button" disabled>批量解析并生成索引</button>
+                <button class="danger-button" id="stopBatchButton" type="button" hidden>停止任务</button>
+              </div>
+              <div class="task-preview" id="batchPreview" hidden>
+                <div class="preview-heading">批量任务预览</div>
+                <div class="preview-list" id="batchPreviewRows"></div>
+              </div>
+              <div class="hint-text" id="batchPermissionHint">请先确认你拥有索引该资源的权限。</div>
+            </div>
+
+            <div class="tab-panel" id="panelCsv" data-panel="csv" role="tabpanel" aria-labelledby="tabCsv">
+              <label class="upload-zone" id="csvDropZone">
+                <input id="csvFileInput" type="file" accept=".csv,text/csv" />
+                <span class="upload-title">拖拽 CSV 文件到此处，或点击选择文件</span>
+                <span class="upload-desc">系统将自动识别分享链接列，也可以在预览中手动确认。</span>
+              </label>
+              <div class="task-actions">
+                <button class="ghost-button" id="csvScanButton" type="button">读取 CSV 并预览</button>
+                <button class="primary-button" id="csvCollectButton" type="button" disabled>从 CSV 生成索引</button>
+                <button class="danger-button" id="stopCsvButton" type="button" hidden>停止任务</button>
+              </div>
+              <div class="task-preview" id="csvPreview" hidden>
+                <div class="preview-heading">CSV 链接预览</div>
+                <div class="preview-list" id="csvPreviewRows"></div>
+              </div>
+              <div class="message inline-message" id="csvFileStatus" role="status" aria-live="polite"></div>
+            </div>
+          </form>
+
+          <div class="progress-panel" id="progressPanel" hidden>
+            <div class="progress-line">
+              <span class="spinner" aria-hidden="true"></span>
+              <strong id="progressText">正在准备采集</strong>
+            </div>
+            <div class="progress-meta" id="progressMeta">当前处理链接：- · 已发现目录 0 · 已发现文件 0 · 当前递归深度 -</div>
+            <div class="progress-track" aria-hidden="true"><span></span></div>
+          </div>
+
+          <div class="message" id="message" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="task-stats" aria-label="本次任务统计" data-index-only>
+          <div class="stat-card"><span>本次解析条目</span><strong id="metricTotal">0</strong></div>
+          <div class="stat-card"><span>目录数量</span><strong id="metricFolders">0</strong></div>
+          <div class="stat-card"><span>文件数量</span><strong id="metricFiles">0</strong></div>
+          <div class="stat-card"><span>失败数量</span><strong id="metricFailed">0</strong></div>
+        </section>
+
+        <section class="result-card" aria-labelledby="resultTitle" data-index-only>
+          <div class="section-heading result-heading">
+            <div>
+              <p class="eyebrow">Results</p>
+              <h3 id="resultTitle">本次索引结果</h3>
+            </div>
+            <div class="result-actions">
+              <button class="ghost-button" id="retryFailedButton" type="button" hidden>重试失败项</button>
+              <button class="ghost-button" id="downloadJson" type="button">导出 JSON</button>
+              <button class="ghost-button" id="downloadCsv" type="button">导出 CSV</button>
+              <button class="icon-button" id="tableSettingsButton" type="button" title="表格设置" aria-label="表格设置">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10v2H4V7Zm12-1h4v4h-4V6ZM4 15h4v2H4v-2Zm6-1h10v4H10v-4Z"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="table-toolbar">
+            <label class="table-search">
+              <span>搜索名称或路径</span>
+              <input id="resultSearchInput" type="search" placeholder="搜索名称或路径" autocomplete="off" />
+            </label>
+            <div class="segmented" role="group" aria-label="类型筛选">
+              <button class="segment active" type="button" data-type-filter="all">全部</button>
+              <button class="segment" type="button" data-type-filter="folder">目录</button>
+              <button class="segment" type="button" data-type-filter="file">文件</button>
+            </div>
+            <div class="segmented" role="group" aria-label="状态筛选">
+              <button class="segment active" type="button" data-status-filter="all">全部</button>
+              <button class="segment" type="button" data-status-filter="success">成功</button>
+              <button class="segment" type="button" data-status-filter="failed">失败</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>名称</th><th>类型</th><th>路径</th><th>链接</th><th>FID</th></tr>
+              </thead>
+              <tbody id="resultRows">
+                <tr class="empty-row">
+                  <td colspan="5">
+                    <strong>暂无索引结果</strong>
+                    <span>请输入分享链接或导入 CSV 文件后开始生成索引。</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="search-band search-view" aria-labelledby="searchTitle" data-view-panel="search" hidden>
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Library Search</p>
+              <h3 id="searchTitle">索引查询</h3>
+              <p class="page-subtitle">检索已保存索引，搜索结果会自动折叠相同打开链接，仅保留不同入口。</p>
+            </div>
+            <div class="result-actions">
+              <button class="ghost-button" id="cleanupInvalidButton" type="button">清理无效索引</button>
+              <button class="ghost-button" id="refreshLibrary" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="search-row">
+            <label class="field">
+              <span>关键词</span>
+              <input id="searchInput" type="search" placeholder="电影名、编号、路径或 fid" autocomplete="off" />
+            </label>
+            <button class="primary-button" id="searchButton" type="button">搜索</button>
+          </div>
+          <div class="cleanup-panel" id="cleanupStatusPanel" hidden>
+            <div class="cleanup-head">
+              <div>
+                <strong id="cleanupProgressText">正在准备清理</strong>
+                <span id="cleanupProgressMeta">已完成 0 / 0</span>
+              </div>
+            </div>
+            <div class="progress-track cleanup-track" aria-hidden="true"><span id="cleanupProgressBar"></span></div>
+            <div class="cleanup-recent" id="cleanupRecent"></div>
+          </div>
+          <div class="mini-list" id="savedRows">
+            <div class="empty-state">暂无已保存索引</div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
