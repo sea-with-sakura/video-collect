@@ -169,7 +169,7 @@ async function handleApi(request, response, url) {
           folders: result.summary.folders,
           files: result.summary.files,
         });
-        items.push(...result.items);
+        for (const item of result.items) items.push(item);
       } catch (error) {
         failed.push({
           shareUrl,

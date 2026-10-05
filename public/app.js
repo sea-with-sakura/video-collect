@@ -24,6 +24,7 @@ const state = {
   activeTab: "single",
   lastResult: null,
   progressTimer: null,
+  batchRenderTimer: null,
   cleanupTimer: null,
   lastSearchQuery: "",
   csvLinks: [],
@@ -145,6 +146,12 @@ async function boot() {
 }
 
 function bindEvents() {
+  window.addEventListener("beforeunload", (event) => {
+    if (state.isBusy) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
   elements.viewButtons.forEach((button) => {
     button.addEventListener("click", () =>
       setActiveView(button.dataset.viewButton),
@@ -500,152 +507,150 @@ async function collectLinks(payload, shareUrls, sourceLabel) {
 }
 
 async function collectBatchConcurrently(payload, shareUrls, concurrency) {
-  const items = [];
-  const results = [];
-  const failedItems = [];
   const batchMaxDepth = currentProviderLimits().batchMaxDepth ?? 12;
+  const batchResult = {
+    providerId: payload.providerId,
+    providerName: currentProviderName(),
+    source: { shareUrls, exportedAt: new Date().toISOString() },
+    summary: {
+      total: 0,
+      folders: 0,
+      files: 0,
+      generatedAt: new Date().toISOString(),
+    },
+    batch: {
+      status: "running",
+      totalLinks: shareUrls.length,
+      completed: 0,
+      succeeded: 0,
+      emptyLinks: 0,
+      failed: 0,
+      cancelled: 0,
+      saveToLibrary: payload.saveToLibrary,
+      results: [],
+      failedItems: [],
+      concurrency,
+      maxDepth: batchMaxDepth,
+    },
+    items: [],
+  };
   let nextIndex = 0;
-  let completed = 0;
   let active = 0;
+  publishBatchResult(batchResult, true);
 
   const workerCount = Math.min(concurrency, shareUrls.length);
   await Promise.all(
     Array.from({ length: workerCount }, async () => {
       while (nextIndex < shareUrls.length && !state.isCancelled) {
-        const index = nextIndex;
-        nextIndex += 1;
-        active += 1;
-        await collectOneBatchLink({
-          payload,
-          shareUrls,
-          index,
-          items,
-          results,
-          failedItems,
-          batchMaxDepth,
-          getActive: () => active,
-          setCompleted: (value) => {
-            completed = value;
-          },
-          getCompleted: () => completed,
-        });
-        active -= 1;
+        const index = nextIndex++;
+        active++;
+        updateBatchProgress(batchResult, active, index + 1);
+        try {
+          const result = await api("/api/index/export", {
+            method: "POST",
+            body: {
+              ...payload,
+              shareUrl: shareUrls[index],
+              maxDepth: batchMaxDepth,
+              recursive: true,
+              saveToLibrary: false,
+            },
+          });
+          // Keep successful responses received before a stop request. Append
+          // without spreading: large shares can exceed the argument limit.
+          for (const item of result.items) {
+            batchResult.items.push(item);
+            batchResult.summary.total++;
+            if (item.type === "folder") batchResult.summary.folders++;
+            if (item.type === "file") batchResult.summary.files++;
+          }
+          batchResult.batch.results.push({
+            shareUrl: shareUrls[index],
+            ok: true,
+            total: result.summary.total,
+            folders: result.summary.folders,
+            files: result.summary.files,
+          });
+          batchResult.batch.succeeded++;
+          if (!result.items.length) batchResult.batch.emptyLinks++;
+        } catch (error) {
+          if (state.isCancelled) {
+            batchResult.batch.cancelled++;
+          } else {
+            batchResult.batch.failedItems.push({
+              shareUrl: shareUrls[index],
+              ok: false,
+              message: error.message,
+            });
+            batchResult.batch.failed++;
+          }
+        } finally {
+          active--;
+          batchResult.batch.completed++;
+          batchResult.summary.generatedAt = new Date().toISOString();
+          publishBatchResult(batchResult);
+          updateBatchProgress(batchResult, active, index + 1);
+        }
       }
     }),
   );
 
-  const batchResult = {
-    providerId: payload.providerId,
-    providerName: currentProviderName(),
-    source: {
-      shareUrls,
-      exportedAt: new Date().toISOString(),
-    },
-    summary: summarizeItems(items),
-    batch: {
-      totalLinks: shareUrls.length,
-      succeeded: results.length,
-      failed: failedItems.length,
-      results,
-      failedItems,
-      concurrency,
-      maxDepth: batchMaxDepth,
-    },
-    items,
-  };
-
-  if (payload.saveToLibrary && items.length && !state.isCancelled) {
+  batchResult.batch.status = state.isCancelled ? "cancelled" : "completed";
+  publishBatchResult(batchResult, true);
+  if (payload.saveToLibrary && batchResult.items.length && !state.isCancelled) {
     elements.progressText.textContent = "正在统一写入索引库";
-    setMessage(`采集完成，正在统一保存 ${items.length} 条索引。`);
-    batchResult.saved = await api("/api/indexes/save", {
-      method: "POST",
-      body: batchResult,
-    });
+    setMessage(
+      `采集完成，正在统一保存 ${formatNumber(batchResult.items.length)} 条索引。`,
+    );
+    try {
+      batchResult.saved = await api("/api/indexes/save", {
+        method: "POST",
+        // The store copies source into every resource. Keep the full link
+        // list in the export, but avoid duplicating it into every SQLite row.
+        body: {
+          ...batchResult,
+          source: { exportedAt: batchResult.source.exportedAt },
+        },
+      });
+    } catch (error) {
+      throw new Error(
+        `采集结果已保留，但保存到资源库失败：${error.message}。可先导出结果，再重试。`,
+      );
+    }
   }
-
   return batchResult;
 }
 
-async function collectOneBatchLink({
-  payload,
-  shareUrls,
-  index,
-  items,
-  results,
-  failedItems,
-  batchMaxDepth,
-  getActive,
-  setCompleted,
-  getCompleted,
-}) {
-  const current = index + 1;
-  const shareUrl = shareUrls[index];
-  updateBatchProgress({
-    completed: getCompleted(),
-    total: shareUrls.length,
-    succeeded: results.length,
-    failed: failedItems.length,
-    active: getActive(),
-    current,
-    maxDepth: batchMaxDepth,
-  });
-
-  try {
-    const result = await api("/api/index/export", {
-      method: "POST",
-      body: {
-        ...payload,
-        shareUrl,
-        maxDepth: batchMaxDepth,
-        recursive: true,
-        saveToLibrary: false,
-      },
-    });
-
-    items.push(...result.items);
-    results.push({
-      shareUrl,
-      ok: true,
-      total: result.summary.total,
-      folders: result.summary.folders,
-      files: result.summary.files,
-    });
-  } catch (error) {
-    failedItems.push({
-      shareUrl,
-      ok: false,
-      message: state.isCancelled ? "任务已停止" : error.message,
-    });
-  } finally {
-    const completed = getCompleted() + 1;
-    setCompleted(completed);
-    updateBatchProgress({
-      completed,
-      total: shareUrls.length,
-      succeeded: results.length,
-      failed: failedItems.length,
-      active: Math.max(0, getActive() - 1),
-      current,
-      maxDepth: batchMaxDepth,
-    });
+function publishBatchResult(result, immediate = false) {
+  state.lastResult = result;
+  state.failedLinks = result.batch.failedItems;
+  renderResult(result, false);
+  setDownloadsEnabled(result.batch.completed > 0);
+  if (immediate) {
+    clearTimeout(state.batchRenderTimer);
+    state.batchRenderTimer = null;
+    renderResultRows();
+  } else if (!state.batchRenderTimer) {
+    // Update counters immediately; bound table rendering for large batches.
+    state.batchRenderTimer = setTimeout(() => {
+      state.batchRenderTimer = null;
+      renderResultRows();
+    }, 250);
   }
 }
 
-function updateBatchProgress({
-  completed,
-  total,
-  succeeded,
-  failed,
-  active,
-  current,
-  maxDepth = 12,
-}) {
-  const text = `已完成 ${completed} / ${total}，成功 ${succeeded}，失败 ${failed}，运行中 ${active}`;
+function updateBatchProgress(result, active, current) {
+  const batch = result.batch;
+  const empty = batch.emptyLinks ? `（其中 ${batch.emptyLinks} 个无资源）` : "";
+  const text = `已完成 ${batch.completed} / ${batch.totalLinks} 个链接，成功链接 ${batch.succeeded}${empty}，失败链接 ${batch.failed}，运行中 ${active}`;
   elements.taskProgressBar.parentElement.classList.remove("indeterminate");
-  elements.taskProgressBar.style.width = `${total ? (completed / total) * 100 : 0}%`;
+  elements.taskProgressBar.style.width = `${batch.totalLinks ? (batch.completed / batch.totalLinks) * 100 : 0}%`;
   elements.progressText.textContent = text;
-  elements.progressMeta.textContent = `当前处理链接：${current} / ${total} · 已发现目录 ${elements.metricFolders.textContent} · 已发现文件 ${elements.metricFiles.textContent} · 当前递归深度 ${maxDepth}`;
-  setMessage(`${text}。当前批次位置：${current} / ${total}`);
+  elements.progressMeta.textContent = `当前批次位置：${current} / ${batch.totalLinks} · 已采集目录 ${formatNumber(result.summary.folders)} · 已采集文件 ${formatNumber(result.summary.files)} · 递归深度上限 ${batch.maxDepth}`;
+  if (!state.isCancelled)
+    setMessage(
+      `${text}。已采集结果实时显示在下方。${batch.saveToLibrary ? "入库将在全部链接处理完成后进行。" : "本次仅预览，不保存到资源库。"}`,
+    );
 }
 
 async function scanCsvIntoPreview() {
@@ -699,7 +704,9 @@ async function readTextFile(file) {
 
 async function handleIndexResult(result) {
   if (state.isCancelled) {
-    setMessage("任务已停止。", "error");
+    setMessage(
+      `任务已停止，已保留 ${formatNumber(result.items.length)} 条已采集资源，可导出查看；本批次未保存到资源库。`,
+    );
     return;
   }
 
@@ -713,7 +720,7 @@ async function handleIndexResult(result) {
     ? `已保存到索引库：新增 ${result.saved.inserted}，更新 ${result.saved.updated}。`
     : "本次未保存到索引库。";
   const batchText = result.batch
-    ? `链接成功 ${result.batch.succeeded}/${result.batch.totalLinks}，失败 ${result.batch.failed}。`
+    ? `链接成功 ${result.batch.succeeded}/${result.batch.totalLinks}${result.batch.emptyLinks ? `（其中 ${result.batch.emptyLinks} 个无资源）` : ""}，失败 ${result.batch.failed}。`
     : "";
   const failureText = result.batch?.failedItems?.length
     ? `首个失败原因：${result.batch.failedItems[0].message}。`
@@ -761,7 +768,7 @@ function cleanShareUrl(url) {
     .replace(/[)\]}。.!！?？、，,；;]+$/g, "");
 }
 
-function renderResult(result) {
+function renderResult(result, renderRows = true) {
   elements.metricTotal.textContent = formatNumber(result.summary.total);
   elements.metricFolders.textContent = formatNumber(result.summary.folders);
   elements.metricFiles.textContent = formatNumber(result.summary.files);
@@ -770,7 +777,8 @@ function renderResult(result) {
     .closest(".stat-card")
     .classList.toggle("has-failures", Boolean(result.batch?.failed));
   elements.retryFailedButton.hidden = !result.batch?.failedItems?.length;
-  renderResultRows();
+  elements.retryFailedButton.disabled = state.isBusy;
+  if (renderRows) renderResultRows();
 }
 
 function renderResultRows() {
@@ -780,24 +788,70 @@ function renderResultRows() {
     return;
   }
   const { query, type, status } = state.resultFilters;
-  const filtered = result.items.filter((item) => {
-    return (
-      (!query || `${item.title} ${item.path}`.toLowerCase().includes(query)) &&
-      (type === "all" || item.type === type) &&
-      status !== "failed"
-    );
-  });
-  const failures = (result.batch?.failedItems || []).filter((item) => {
-    return (
-      status !== "success" &&
-      type === "all" &&
-      (!query ||
-        `${item.shareUrl} ${item.message}`.toLowerCase().includes(query))
-    );
-  });
+  const filtered =
+    !query && type === "all" && status !== "failed"
+      ? result.items
+      : result.items.filter((item) => {
+          return (
+            (!query ||
+              `${item.title} ${item.path}`.toLowerCase().includes(query)) &&
+            (type === "all" || item.type === type) &&
+            status !== "failed"
+          );
+        });
+  const failureItems = result.batch?.failedItems || [];
+  const failures =
+    !query && type === "all" && status !== "success"
+      ? failureItems
+      : failureItems.filter((item) => {
+          return (
+            status !== "success" &&
+            type === "all" &&
+            (!query ||
+              `${item.shareUrl} ${item.message}`.toLowerCase().includes(query))
+          );
+        });
   const count = filtered.length + failures.length;
-  elements.resultCountLabel.textContent = `${formatNumber(count)} 条结果${count > 500 ? " · 显示前 500 条" : ""}`;
+  const stage =
+    result.batch?.status === "running"
+      ? "采集中 · "
+      : result.batch?.status === "cancelled"
+        ? "已停止 · "
+        : "";
+  elements.resultCountLabel.textContent = `${stage}${formatNumber(count)} 条结果${count > 500 ? " · 显示前 500 条" : ""}`;
   if (!count) {
+    if (
+      result.batch?.status === "running" &&
+      !result.items.length &&
+      !result.batch.failed
+    ) {
+      renderEmptyResult(
+        "正在采集资源",
+        result.batch.emptyLinks
+          ? `已完成的 ${result.batch.emptyLinks} 个链接未返回资源，其他链接仍在采集中。`
+          : "每个链接处理完成后，资源与失败原因会实时显示在这里。",
+      );
+      return;
+    }
+    if (
+      result.batch?.status === "cancelled" &&
+      !result.items.length &&
+      !result.batch.failed
+    ) {
+      renderEmptyResult("任务已停止", "停止前尚未采集到资源。");
+      return;
+    }
+    if (
+      result.batch?.status === "completed" &&
+      !result.items.length &&
+      !result.batch.failed
+    ) {
+      renderEmptyResult(
+        "这些链接没有返回可索引的资源",
+        `已成功处理 ${result.batch.succeeded} 个链接，但资源数量为 0。可检查分享目录内容，或换一个链接再试。`,
+      );
+      return;
+    }
     renderEmptyResult(
       result.items.length || result.batch?.failed
         ? "没有匹配的结果"
@@ -1162,6 +1216,24 @@ function updatePermissionState() {
 
 function beginTask(mode) {
   state.isCancelled = false;
+  clearTimeout(state.batchRenderTimer);
+  state.batchRenderTimer = null;
+  state.lastResult = null;
+  state.failedLinks = [];
+  state.resultFilters = { query: "", type: "all", status: "all" };
+  elements.resultSearchInput.value = "";
+  setSegment(
+    "[data-type-filter]",
+    document.querySelector('[data-type-filter="all"]'),
+  );
+  setSegment(
+    "[data-status-filter]",
+    document.querySelector('[data-status-filter="all"]'),
+  );
+  renderResult({ items: [], summary: { total: 0, folders: 0, files: 0 } });
+  elements.resultCountLabel.textContent = "采集中";
+  renderEmptyResult("正在采集资源", "已采集结果会显示在这里。");
+  setDownloadsEnabled(false);
   setFormBusy(true);
   elements.stopTaskButton.hidden = mode !== "single";
   elements.stopBatchButton.hidden = mode !== "batch";
@@ -1170,6 +1242,27 @@ function beginTask(mode) {
 }
 
 function endTask() {
+  clearTimeout(state.batchRenderTimer);
+  state.batchRenderTimer = null;
+  if (state.lastResult) renderResultRows();
+  else {
+    elements.resultCountLabel.textContent = state.isCancelled
+      ? "已停止"
+      : "采集未完成";
+    renderEmptyResult(
+      state.isCancelled ? "任务已停止" : "本次没有采集到结果",
+      "可重新采集或更换分享链接。",
+    );
+  }
+  if (state.isCancelled && !state.lastResult) setMessage("任务已停止。");
+  else if (
+    state.isCancelled &&
+    state.lastResult.batch?.status === "completed"
+  ) {
+    setMessage(
+      "已停止等待保存响应，采集结果已保留，可先导出；入库情况请在资源库核查。",
+    );
+  }
   stopProgress();
   setFormBusy(false);
   elements.stopTaskButton.hidden = true;
@@ -1179,6 +1272,7 @@ function endTask() {
   setPrimaryLoading("batch", false);
   setPrimaryLoading("csv", false);
   updatePermissionState();
+  elements.retryFailedButton.disabled = false;
 }
 
 function stopTask() {
@@ -1187,7 +1281,7 @@ function stopTask() {
     controller.abort();
   }
   state.activeControllers.clear();
-  setMessage("任务已停止。", "error");
+  setMessage("正在停止任务，已采集结果会保留在下方。");
 }
 
 function setPrimaryLoading(mode, loading) {
@@ -1246,15 +1340,6 @@ function currentProviderCopy() {
       label: "分享链接",
     }
   );
-}
-
-function summarizeItems(items) {
-  return {
-    total: items.length,
-    folders: items.filter((item) => item.type === "folder").length,
-    files: items.filter((item) => item.type === "file").length,
-    generatedAt: new Date().toISOString(),
-  };
 }
 
 function setSegment(selector, activeButton) {

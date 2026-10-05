@@ -5,17 +5,26 @@ const DEFAULT_DELAY_MS = 1000;
 const DEFAULT_CLEANUP_CONCURRENCY = 1;
 
 let cleanupState = idleState();
+let cleanupStart = null;
 
 export function cleanupStatus() {
   return cleanupState;
 }
 
-export async function startInvalidCleanup({ query = "", delayMs = DEFAULT_DELAY_MS } = {}) {
+export function startInvalidCleanup(options = {}) {
   if (cleanupState.status === "running") {
-    return cleanupState;
+    return Promise.resolve(cleanupState);
   }
+  // Listing resources now runs asynchronously in the database worker. Share
+  // the startup promise so two requests cannot launch overlapping cleanups.
+  if (!cleanupStart) {
+    cleanupStart = initializeCleanup(options).finally(() => { cleanupStart = null; });
+  }
+  return cleanupStart;
+}
 
-  const resources = await listIndexResources({ query });
+async function initializeCleanup({ query = "", delayMs = DEFAULT_DELAY_MS }) {
+  const resources = await listIndexResources({ query, includeSource: false });
   cleanupState = {
     status: "running",
     query,

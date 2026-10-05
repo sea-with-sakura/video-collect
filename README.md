@@ -11,7 +11,7 @@ Video Collect 是一个网盘分享资源索引工具，使用 Node.js 原生 HT
 - CLI 当前支持夸克分享链接解析及索引导出。
 - 支持 Docker Compose 部署，运行数据保存在 `data/`，导出文件保存在 `exports/`；这些本地数据不提交到 Git。
 
-主要代码：`src/server.js` 提供 HTTP API，`src/providers/` 注册数据源，`src/*-share.js` 对接网盘分享 API，`src/index-store.js` 管理 SQLite 索引，`src/invalid-cleaner.js` 清理失效条目，`public/` 提供 Web 界面。
+主要代码：`src/server.js` 提供 HTTP API，`src/providers/` 注册数据源，`src/*-share.js` 对接网盘分享 API，`src/index-store.js` 调度数据库线程，`src/index-store-core.js` 管理 SQLite 索引，`src/invalid-cleaner.js` 清理失效条目，`public/` 提供 Web 界面。
 
 本地启动（Node.js 需支持内置 `node:sqlite`）：
 
@@ -67,9 +67,11 @@ GET /api/indexes/search?q=<keyword>&limit=50
 GET /api/indexes/stats
 ```
 
-The web app supports batch import. Pick a provider in the sidebar, then paste matching share links copied from Excel into the batch box; one link per line or blank-line-separated blocks both work. Batch import uses max depth `12` by default so nested folders are collected as deeply as the provider allows.
+The web app supports batch import. Pick a provider on the collection page, then paste matching share links copied from Excel into the batch box; one link per line or blank-line-separated blocks both work. Batch import uses max depth `12` by default so nested folders are collected as deeply as the provider allows.
 
-Batch and CSV imports use controlled concurrency in the browser. The default concurrency is `3`, configurable in the UI up to `8`. Each link is fetched without writing immediately, then all collected results are saved once at the end. This is faster than serial import and avoids concurrent writes to `data/resource-index.json`.
+Batch and CSV imports use controlled concurrency in the browser. The default concurrency is `3`, configurable in the UI up to `8`. Resource counts, results, and failed links update as each link completes. Successful links with no resources are counted separately. Each link is fetched without writing immediately, then all collected results are saved to SQLite once at the end when saving is selected. Stopping collection retains completed results for export without saving the partial batch. Keep the page open until collection and saving finish; pending results are held in browser memory, and leaving the page during collection prompts for confirmation.
+
+The full batch link list is included in JSON exports, but is omitted from the source metadata sent to SQLite to avoid copying thousands of links into every resource record. The storage layer also strips this list from requests made by older clients. Each resource retains its own `sourceShareUrl` and per-resource share URL. SQLite operations run serially in a worker thread so large atomic saves do not block HTTP health checks, provider requests, or cleanup status polling. Cleanup loads only the fields needed for validation, rather than copying all stored source metadata into memory.
 
 CSV import is also supported. Upload a `.csv` file and the browser scans the entire file text for links that match the selected provider, not a fixed column, so links can appear in any column or inside mixed notes. UTF-8 and common Chinese Excel CSV encoding are handled on the client side. The detected links can be filled into the batch box or imported directly.
 
@@ -159,7 +161,9 @@ Providers live behind a small registry:
 - `src/providers/aliyun-provider.js`: Aliyun Drive share provider
 - `src/aliyun-share.js`: Aliyun Drive share API client and normalizer
 - `src/server.js`: common API surface
-- `src/index-store.js`: SQLite-backed local search store
+- `src/index-store.js`: asynchronous database worker interface
+- `src/index-store-worker.js`: serial database operation queue
+- `src/index-store-core.js`: SQLite-backed local search store
 
 To add TMDB, MusicBrainz, AList, or another API, add a `*-provider.js` that implements:
 
