@@ -339,9 +339,9 @@ function handleError(response, error) {
   }
 
   if (error instanceof QuarkShareError || error instanceof AliyunShareError) {
-    sendJson(response, 502, {
+    sendJson(response, error.details?.code === "provider_timeout" ? 504 : 502, {
       error: {
-        code: "provider_error",
+        code: error.details?.code || "provider_error",
         message: error.message,
         details: error.details,
       },

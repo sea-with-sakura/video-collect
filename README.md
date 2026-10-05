@@ -95,6 +95,8 @@ Open:
 http://<nas-ip>:4173
 ```
 
+The supplied Compose configuration uses host networking on Linux/NAS so the app shares the host's DNS and outbound routing, including IPv6. `HOST` and `PORT` control the listening address directly; no Docker port mapping is needed. This avoids provider connection timeouts when the host can reach a cloud API but the Docker bridge cannot. Cloud API requests have a 10-second timeout and return a readable error when the provider cannot be reached.
+
 Persistent data lives in:
 
 ```text

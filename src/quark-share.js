@@ -1,3 +1,5 @@
+import { fetchProviderText } from "./provider-request.js";
+
 const DEFAULT_HEADERS = {
   accept: "application/json, text/plain, */*",
   "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -209,15 +211,13 @@ export class QuarkShareClient {
   }
 
   async fetchJson(url, options = {}) {
-    const response = await this.fetchImpl(url, {
+    const { response, text } = await fetchProviderText(this.fetchImpl, url, {
       ...options,
       headers: {
         ...this.headers,
         ...(options.headers || {}),
       },
-    });
-
-    const text = await response.text();
+    }, { providerName: "夸克网盘", ErrorClass: QuarkShareError });
     let json;
 
     try {

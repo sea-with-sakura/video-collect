@@ -3,12 +3,11 @@ services:
     build: .
     container_name: video-collect
     restart: unless-stopped
+    network_mode: host
     environment:
       HOST: 0.0.0.0
       PORT: 4173
       NODE_ENV: production
-    ports:
-      - "4173:4173"
     volumes:
       - ./data:/app/data
       - ./exports:/app/exports

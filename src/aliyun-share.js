@@ -1,3 +1,5 @@
+import { fetchProviderText } from "./provider-request.js";
+
 const DEFAULT_HEADERS = {
   accept: "application/json, text/plain, */*",
   "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -180,15 +182,13 @@ export class AliyunShareClient {
       }
 
       try {
-        const response = await this.fetchImpl(url, {
+        const { response, text } = await fetchProviderText(this.fetchImpl, url, {
           ...options,
           headers: {
             ...this.headers,
             ...(options.headers || {}),
           },
-        });
-
-        const text = await response.text();
+        }, { providerName: "阿里云盘", ErrorClass: AliyunShareError });
         let json;
 
         try {
@@ -215,7 +215,7 @@ export class AliyunShareClient {
         }
       } catch (error) {
         lastError = error;
-        if (error instanceof AliyunShareError && !isRetryableProviderError(error.details?.status, error.details?.response)) {
+        if (error instanceof AliyunShareError && !error.details?.retryable && !isRetryableProviderError(error.details?.status, error.details?.response)) {
           throw error;
         }
       }

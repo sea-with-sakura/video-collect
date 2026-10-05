@@ -1,6 +1,7 @@
 const PROVIDER_URL_REGEX = {
   "quark-share": /https?:\/\/pan\.quark\.cn\/s\/[^\s"'<>，,；;]+/g,
-  "aliyun-share": /https?:\/\/(?:www\.)?(?:aliyundrive\.com|alipan\.com)\/s\/[^\s"'<>，,；;]+/g,
+  "aliyun-share":
+    /https?:\/\/(?:www\.)?(?:aliyundrive\.com|alipan\.com)\/s\/[^\s"'<>，,；;]+/g,
 };
 
 const PROVIDER_COPY = {
@@ -17,7 +18,9 @@ const PROVIDER_COPY = {
 const state = {
   providerId: "quark-share",
   providers: [],
-  activeView: "index",
+  activeView: window.location.hash === "#collect" ? "index" : "search",
+  isBusy: false,
+  searchSequence: 0,
   activeTab: "single",
   lastResult: null,
   progressTimer: null,
@@ -36,6 +39,19 @@ const state = {
 
 const elements = {
   apiStatus: document.querySelector("#apiStatus"),
+  viewBreadcrumb: document.querySelector("#viewBreadcrumb"),
+  librarySearchForm: document.querySelector("#librarySearchForm"),
+  navLibraryCount: document.querySelector("#navLibraryCount"),
+  libraryFolders: document.querySelector("#libraryFolders"),
+  libraryFiles: document.querySelector("#libraryFiles"),
+  libraryProviders: document.querySelector("#libraryProviders"),
+  libraryResultsTitle: document.querySelector("#libraryResultsTitle"),
+  libraryResultsMeta: document.querySelector("#libraryResultsMeta"),
+  csvFileName: document.querySelector("#csvFileName"),
+  resultCountLabel: document.querySelector("#resultCountLabel"),
+  showFid: document.querySelector("#showFid"),
+  resultTable: document.querySelector("#resultTable"),
+  taskProgressBar: document.querySelector("#taskProgressBar"),
   providerList: document.querySelector("#providerList"),
   viewButtons: document.querySelectorAll("[data-view-button]"),
   indexOnlySections: document.querySelectorAll("[data-index-only]"),
@@ -93,31 +109,46 @@ boot();
 
 async function boot() {
   bindEvents();
-  setActiveView(state.activeView);
+  setActiveView(state.activeView, false);
   setDownloadsEnabled(false);
   updatePermissionState();
   renderEmptyResult();
+  renderLibraryLoading();
 
   try {
     await api("/api/health");
-    elements.apiStatus.textContent = "Online";
+    elements.apiStatus.textContent = "服务在线";
     elements.apiStatus.classList.add("ok");
-
     const { providers } = await api("/api/providers");
     state.providers = providers;
+    elements.libraryProviders.textContent = formatNumber(providers.length);
     renderProviders();
     syncProviderUi();
-    await refreshLibrary();
   } catch (error) {
-    elements.apiStatus.textContent = "Offline";
+    elements.apiStatus.textContent = "连接失败";
     elements.apiStatus.classList.add("error");
-    setMessage(error.message, "error");
+    renderLibraryError(error.message);
+    setMessage(`无法连接服务：${error.message}`, "error");
+    return;
+  }
+  await refreshLibrary();
+  try {
+    const status = await api("/api/indexes/cleanup-invalid/status");
+    renderCleanupStatus(status);
+    if (status.status === "running") {
+      elements.cleanupInvalidButton.disabled = true;
+      startCleanupPolling();
+    }
+  } catch {
+    /* The library remains usable if cleanup status is unavailable. */
   }
 }
 
 function bindEvents() {
   elements.viewButtons.forEach((button) => {
-    button.addEventListener("click", () => setActiveView(button.dataset.viewButton));
+    button.addEventListener("click", () =>
+      setActiveView(button.dataset.viewButton),
+    );
   });
 
   document.querySelectorAll("[data-tab]").forEach((button) => {
@@ -126,7 +157,10 @@ function bindEvents() {
 
   elements.collectorForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    await collectIndex();
+    if (state.isBusy) return;
+    if (state.activeTab === "batch") await collectBatchIndex();
+    else if (state.activeTab === "csv") await collectCsvIndex();
+    else await collectIndex();
   });
 
   elements.parseButton.addEventListener("click", parseCurrentUrl);
@@ -137,28 +171,91 @@ function bindEvents() {
   elements.downloadJson.addEventListener("click", () => downloadResult("json"));
   elements.downloadCsv.addEventListener("click", () => downloadResult("csv"));
   elements.retryFailedButton.addEventListener("click", retryFailedLinks);
-  elements.refreshLibrary.addEventListener("click", refreshLibrary);
+  elements.refreshLibrary.addEventListener("click", () => refreshLibrary());
   elements.cleanupInvalidButton.addEventListener("click", startInvalidCleanup);
-  elements.searchButton.addEventListener("click", searchLibrary);
-  elements.searchInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
+  elements.librarySearchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    searchLibrary();
+  });
+  elements.searchInput.addEventListener("search", () => {
+    if (!elements.searchInput.value) searchLibrary();
+  });
+  elements.showFid.addEventListener("change", () => {
+    elements.resultTable.classList.toggle("show-fid", elements.showFid.checked);
+  });
+  document.addEventListener("keydown", (event) => {
+    const editing = event.target.closest(
+      "input, textarea, select, [contenteditable='true']",
+    );
+    if (
+      event.key === "/" &&
+      !editing &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey
+    ) {
       event.preventDefault();
+      if (state.activeView !== "search") setActiveView("search");
+      elements.searchInput.focus();
+    }
+  });
+  window.addEventListener("hashchange", () => {
+    setActiveView(window.location.hash === "#collect" ? "index" : "search");
+  });
+  document.addEventListener("click", (event) => {
+    const copy = event.target.closest("[data-copy]");
+    if (copy) copyLink(copy);
+    const go = event.target.closest("[data-go-view]");
+    if (go) setActiveView(go.dataset.goView);
+    if (event.target.closest("[data-search-retry]")) {
+      if (!state.providers.length) window.location.reload();
+      else refreshLibrary();
+    }
+    if (event.target.closest("[data-search-clear]")) {
+      elements.searchInput.value = "";
       searchLibrary();
     }
+  });
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    button.addEventListener("keydown", (event) => {
+      const tabs = [...document.querySelectorAll("[data-tab]")];
+      const index = tabs.indexOf(button);
+      let next;
+      if (event.key === "ArrowRight") next = tabs[(index + 1) % tabs.length];
+      if (event.key === "ArrowLeft")
+        next = tabs[(index + tabs.length - 1) % tabs.length];
+      if (event.key === "Home") next = tabs[0];
+      if (event.key === "End") next = tabs[tabs.length - 1];
+      if (next) {
+        event.preventDefault();
+        setActiveTab(next.dataset.tab);
+        next.focus();
+      }
+    });
   });
 
   elements.confirmAuthorized.addEventListener("change", updatePermissionState);
 
-  [elements.stopTaskButton, elements.stopBatchButton, elements.stopCsvButton].forEach((button) => {
+  [
+    elements.stopTaskButton,
+    elements.stopBatchButton,
+    elements.stopCsvButton,
+  ].forEach((button) => {
     button.addEventListener("click", stopTask);
   });
 
   elements.batchLinks.addEventListener("input", () => {
-    renderPreviewRows(elements.batchPreview, elements.batchPreviewRows, extractShareUrls(elements.batchLinks.value));
+    renderPreviewRows(
+      elements.batchPreview,
+      elements.batchPreviewRows,
+      extractShareUrls(elements.batchLinks.value),
+    );
   });
 
   elements.resultSearchInput.addEventListener("input", () => {
-    state.resultFilters.query = elements.resultSearchInput.value.trim().toLowerCase();
+    state.resultFilters.query = elements.resultSearchInput.value
+      .trim()
+      .toLowerCase();
     renderResultRows();
   });
 
@@ -195,28 +292,28 @@ function bindEvents() {
   });
 }
 
-function setActiveView(view) {
+function setActiveView(view, load = true) {
   state.activeView = view === "search" ? "search" : "index";
-
+  const label = state.activeView === "search" ? "资源库" : "采集资源";
+  document.title = `${label} · Video Collect`;
+  elements.viewBreadcrumb.textContent = label;
   elements.viewButtons.forEach((button) => {
     const active = button.dataset.viewButton === state.activeView;
     button.classList.toggle("active", active);
-    button.setAttribute("aria-current", active ? "page" : "false");
+    if (button.classList.contains("workspace-button")) {
+      if (active) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    }
   });
-
   elements.indexOnlySections.forEach((section) => {
     section.hidden = state.activeView !== "index";
   });
-
-  if (elements.searchPanel) {
-    elements.searchPanel.hidden = state.activeView !== "search";
-  }
-
-  if (state.activeView === "search") {
-    searchLibrary().catch((error) => {
-      elements.savedRows.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
-    });
-    window.setTimeout(() => elements.searchInput?.focus(), 0);
+  elements.searchPanel.hidden = state.activeView !== "search";
+  const hash = state.activeView === "index" ? "#collect" : "#library";
+  if (window.location.hash !== hash) history.replaceState(null, "", hash);
+  if (load && state.activeView === "search") {
+    searchLibrary();
+    elements.searchInput.focus({ preventScroll: true });
   }
 }
 
@@ -226,28 +323,34 @@ function setActiveTab(tab) {
     const active = button.dataset.tab === tab;
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
   });
   document.querySelectorAll("[data-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.panel === tab);
+    panel.hidden = panel.dataset.panel !== tab;
   });
   updatePermissionState();
 }
 
 function renderProviders() {
   elements.providerList.innerHTML = "";
-
   for (const provider of state.providers) {
     const button = document.createElement("button");
+    const active = provider.id === state.providerId;
     button.type = "button";
-    button.className = `provider-button ${provider.id === state.providerId ? "active" : ""}`;
+    button.className = `provider-button ${active ? "active" : ""}`;
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = state.isBusy;
     button.innerHTML = `
-      <span class="dot" aria-hidden="true"></span>
-      <span class="provider-name">${escapeHtml(provider.displayName)}</span>
-      <span class="provider-tag">${escapeHtml(provider.category)}</span>
-    `;
+      ${icon("cloud", "provider-icon")}
+      <span class="provider-name">${escapeHtml(providerLabel(provider.id))}<small>${escapeHtml(provider.displayName)}</small></span>
+      <span class="provider-check">${icon("check")}</span>`;
     button.addEventListener("click", () => {
+      if (state.isBusy) return;
       state.providerId = provider.id;
       state.csvLinks = [];
+      elements.csvFileInput.value = "";
+      elements.csvFileName.textContent = "选择 .csv 文件";
       renderProviders();
       syncProviderUi();
     });
@@ -259,7 +362,7 @@ function syncProviderUi() {
   const copy = currentProviderCopy();
   const limits = currentProviderLimits();
   const maxConcurrency = limits.maxConcurrency || 8;
-  elements.shareUrl.placeholder = `请输入分享链接，例如：${copy.example}`;
+  elements.shareUrl.placeholder = copy.example;
   elements.batchLinks.placeholder = `每行输入一个${copy.label}，也支持用空格、逗号或换行分隔。`;
   elements.batchConcurrency.max = String(maxConcurrency);
   if (Number(elements.batchConcurrency.value || 1) > maxConcurrency) {
@@ -269,13 +372,23 @@ function syncProviderUi() {
     elements.batchConcurrency.value = String(limits.defaultBatchConcurrency);
   }
   elements.csvFileStatus.textContent = "";
-  renderPreviewRows(elements.batchPreview, elements.batchPreviewRows, extractShareUrls(elements.batchLinks.value));
-  renderPreviewRows(elements.csvPreview, elements.csvPreviewRows, state.csvLinks);
+  renderPreviewRows(
+    elements.batchPreview,
+    elements.batchPreviewRows,
+    extractShareUrls(elements.batchLinks.value),
+  );
+  renderPreviewRows(
+    elements.csvPreview,
+    elements.csvPreviewRows,
+    state.csvLinks,
+  );
   updatePermissionState();
 }
 
 async function parseCurrentUrl() {
   const payload = formPayload();
+  if (state.isBusy) return;
+
   if (!payload.shareUrl) {
     setMessage("请输入有效的分享链接。", "error");
     return;
@@ -303,6 +416,8 @@ async function parseCurrentUrl() {
 async function collectIndex() {
   const payload = formPayload();
 
+  if (state.isBusy) return;
+
   if (!payload.shareUrl) {
     setMessage("请输入有效的分享链接。", "error");
     return;
@@ -314,7 +429,7 @@ async function collectIndex() {
   }
 
   beginTask("single");
-  startProgress(["解析分享入口", "获取目录授权", "读取目录元数据", "生成名称与链接映射", "写入本地索引库"]);
+  startProgress(["正在读取分享目录，较大的目录可能需要一些时间"]);
   setMessage("正在解析…");
 
   try {
@@ -340,13 +455,19 @@ async function collectBatchIndex() {
 
 async function collectCsvIndex() {
   const payload = formPayload();
-  const shareUrls = state.csvLinks.length ? state.csvLinks : await readCsvLinks();
+  const shareUrls = state.csvLinks.length
+    ? state.csvLinks
+    : await readCsvLinks();
   await collectLinks(payload, shareUrls, "CSV 文件");
 }
 
 async function collectLinks(payload, shareUrls, sourceLabel) {
+  if (state.isBusy) return;
   if (!shareUrls.length) {
-    setMessage(`${sourceLabel}中没有识别到${currentProviderCopy().label}。`, "error");
+    setMessage(
+      `${sourceLabel}中没有识别到${currentProviderCopy().label}。`,
+      "error",
+    );
     return;
   }
 
@@ -356,12 +477,18 @@ async function collectLinks(payload, shareUrls, sourceLabel) {
   }
 
   beginTask(state.activeTab);
-  startProgress(["解析批量链接"]);
+  startProgress(["正在采集批量链接"]);
   const concurrency = getBatchConcurrency();
-  setMessage(`已识别 ${shareUrls.length} 个链接，并发数 ${concurrency}，正在解析…`);
+  setMessage(
+    `已识别 ${shareUrls.length} 个链接，并发数 ${concurrency}，正在解析…`,
+  );
 
   try {
-    const result = await collectBatchConcurrently(payload, shareUrls, concurrency);
+    const result = await collectBatchConcurrently(
+      payload,
+      shareUrls,
+      concurrency,
+    );
     await handleIndexResult(result);
   } catch (error) {
     if (!state.isCancelled) {
@@ -382,28 +509,30 @@ async function collectBatchConcurrently(payload, shareUrls, concurrency) {
   let active = 0;
 
   const workerCount = Math.min(concurrency, shareUrls.length);
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    while (nextIndex < shareUrls.length && !state.isCancelled) {
-      const index = nextIndex;
-      nextIndex += 1;
-      active += 1;
-      await collectOneBatchLink({
-        payload,
-        shareUrls,
-        index,
-        items,
-        results,
-        failedItems,
-        batchMaxDepth,
-        getActive: () => active,
-        setCompleted: (value) => {
-          completed = value;
-        },
-        getCompleted: () => completed,
-      });
-      active -= 1;
-    }
-  }));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < shareUrls.length && !state.isCancelled) {
+        const index = nextIndex;
+        nextIndex += 1;
+        active += 1;
+        await collectOneBatchLink({
+          payload,
+          shareUrls,
+          index,
+          items,
+          results,
+          failedItems,
+          batchMaxDepth,
+          getActive: () => active,
+          setCompleted: (value) => {
+            completed = value;
+          },
+          getCompleted: () => completed,
+        });
+        active -= 1;
+      }
+    }),
+  );
 
   const batchResult = {
     providerId: payload.providerId,
@@ -502,8 +631,18 @@ async function collectOneBatchLink({
   }
 }
 
-function updateBatchProgress({ completed, total, succeeded, failed, active, current, maxDepth = 12 }) {
+function updateBatchProgress({
+  completed,
+  total,
+  succeeded,
+  failed,
+  active,
+  current,
+  maxDepth = 12,
+}) {
   const text = `已完成 ${completed} / ${total}，成功 ${succeeded}，失败 ${failed}，运行中 ${active}`;
+  elements.taskProgressBar.parentElement.classList.remove("indeterminate");
+  elements.taskProgressBar.style.width = `${total ? (completed / total) * 100 : 0}%`;
   elements.progressText.textContent = text;
   elements.progressMeta.textContent = `当前处理链接：${current} / ${total} · 已发现目录 ${elements.metricFolders.textContent} · 已发现文件 ${elements.metricFiles.textContent} · 当前递归深度 ${maxDepth}`;
   setMessage(`${text}。当前批次位置：${current} / ${total}`);
@@ -516,17 +655,22 @@ async function scanCsvIntoPreview() {
     elements.batchLinks.value = links.join("\n\n");
     renderPreviewRows(elements.csvPreview, elements.csvPreviewRows, links);
     renderPreviewRows(elements.batchPreview, elements.batchPreviewRows, links);
-    elements.csvCollectButton.disabled = !elements.confirmAuthorized.checked;
-    setCsvStatus(`已从 CSV 识别 ${links.length} 个唯一${currentProviderCopy().label}。`, "ok");
+    updatePermissionState();
+    setCsvStatus(
+      `已从 CSV 识别 ${links.length} 个唯一${currentProviderCopy().label}。`,
+      "ok",
+    );
   } catch (error) {
     state.csvLinks = [];
     renderPreviewRows(elements.csvPreview, elements.csvPreviewRows, []);
+    updatePermissionState();
     setCsvStatus(error.message, "error");
   }
 }
 
 async function readCsvLinks() {
   const file = elements.csvFileInput.files?.[0];
+  elements.csvFileName.textContent = file?.name || "选择 .csv 文件";
   if (!file) {
     throw new Error("请先选择 CSV 文件。");
   }
@@ -545,7 +689,9 @@ async function readTextFile(file) {
   const bytes = new Uint8Array(buffer);
 
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "");
+    return new TextDecoder("utf-8", { fatal: true })
+      .decode(bytes)
+      .replace(/^\uFEFF/, "");
   } catch {
     return new TextDecoder("gb18030").decode(bytes).replace(/^\uFEFF/, "");
   }
@@ -591,7 +737,8 @@ function formPayload(overrides = {}) {
 }
 
 function extractShareUrls(text) {
-  const matcher = PROVIDER_URL_REGEX[state.providerId] || PROVIDER_URL_REGEX["quark-share"];
+  const matcher =
+    PROVIDER_URL_REGEX[state.providerId] || PROVIDER_URL_REGEX["quark-share"];
   const matches = String(text || "").match(matcher) || [];
   const seen = new Set();
   const links = [];
@@ -615,78 +762,76 @@ function cleanShareUrl(url) {
 }
 
 function renderResult(result) {
-  elements.metricTotal.textContent = result.summary.total;
-  elements.metricFolders.textContent = result.summary.folders;
-  elements.metricFiles.textContent = result.summary.files;
-  elements.metricFailed.textContent = result.batch?.failed || 0;
-  elements.retryFailedButton.hidden = !(result.batch?.failedItems?.length);
+  elements.metricTotal.textContent = formatNumber(result.summary.total);
+  elements.metricFolders.textContent = formatNumber(result.summary.folders);
+  elements.metricFiles.textContent = formatNumber(result.summary.files);
+  elements.metricFailed.textContent = formatNumber(result.batch?.failed || 0);
+  elements.metricFailed
+    .closest(".stat-card")
+    .classList.toggle("has-failures", Boolean(result.batch?.failed));
+  elements.retryFailedButton.hidden = !result.batch?.failedItems?.length;
   renderResultRows();
 }
 
 function renderResultRows() {
   const result = state.lastResult;
-  if (!result || !result.items.length) {
+  if (!result) {
     renderEmptyResult();
     return;
   }
-
+  const { query, type, status } = state.resultFilters;
   const filtered = result.items.filter((item) => {
-    const query = state.resultFilters.query;
-    const matchesQuery = !query || `${item.title} ${item.path}`.toLowerCase().includes(query);
-    const matchesType = state.resultFilters.type === "all" || item.type === state.resultFilters.type;
-    const matchesStatus = state.resultFilters.status === "all" || state.resultFilters.status === "success";
-    return matchesQuery && matchesType && matchesStatus;
+    return (
+      (!query || `${item.title} ${item.path}`.toLowerCase().includes(query)) &&
+      (type === "all" || item.type === type) &&
+      status !== "failed"
+    );
   });
-
-  if (!filtered.length) {
-    elements.resultRows.innerHTML = `
-      <tr class="empty-row">
-        <td colspan="5">
-          <strong>没有匹配结果</strong>
-          <span>请调整搜索关键词或筛选条件。</span>
-        </td>
-      </tr>
-    `;
+  const failures = (result.batch?.failedItems || []).filter((item) => {
+    return (
+      status !== "success" &&
+      type === "all" &&
+      (!query ||
+        `${item.shareUrl} ${item.message}`.toLowerCase().includes(query))
+    );
+  });
+  const count = filtered.length + failures.length;
+  elements.resultCountLabel.textContent = `${formatNumber(count)} 条结果${count > 500 ? " · 显示前 500 条" : ""}`;
+  if (!count) {
+    renderEmptyResult(
+      result.items.length || result.batch?.failed
+        ? "没有匹配的结果"
+        : "这个分享中没有可索引的资源",
+      result.items.length || result.batch?.failed
+        ? "试试其他关键词或筛选条件。"
+        : "尝试其他分享链接，或调整递归深度。",
+    );
     return;
   }
-
-  elements.resultRows.innerHTML = filtered.slice(0, 500).map((item) => `
-    <tr>
-      <td title="${escapeHtml(item.title)}">
-        <span class="item-name">${item.type === "folder" ? "📁" : "📄"} ${escapeHtml(item.title)}</span>
-      </td>
-      <td><span class="type-badge ${item.type}">${item.type === "folder" ? "目录" : "文件"}</span></td>
-      <td title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</td>
-      <td>
-        <button class="link-copy" type="button" data-copy="${escapeAttribute(item.shareLink)}" title="${escapeAttribute(item.shareLink)}">
-          复制链接
-        </button>
-        <a class="link-cell" href="${escapeAttribute(item.shareLink)}" target="_blank" rel="noreferrer">打开</a>
-      </td>
-      <td class="fid-cell" title="${escapeHtml(item.fid)}">${escapeHtml(item.fid)}</td>
-    </tr>
-  `).join("");
-
-  elements.resultRows.querySelectorAll("[data-copy]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(button.dataset.copy);
-      button.textContent = "已复制";
-      setTimeout(() => {
-        button.textContent = "复制链接";
-      }, 1200);
-    });
-  });
+  const failureRows = failures.slice(0, 500).map(
+    (item) => `
+    <tr class="failed-row"><td title="${escapeAttribute(item.shareUrl)}"><span class="item-name">${icon("warning-circle")}<span>${escapeHtml(item.shareUrl)}</span></span></td>
+    <td><span class="type-badge failed">失败</span></td><td title="${escapeAttribute(item.message)}">${escapeHtml(item.message)}</td>
+    <td><button class="link-copy" type="button" data-copy="${escapeAttribute(item.shareUrl)}">复制链接</button></td><td class="fid-cell">—</td></tr>`,
+  );
+  const successRows = filtered
+    .slice(0, Math.max(0, 500 - failureRows.length))
+    .map(
+      (item) => `
+    <tr><td title="${escapeAttribute(item.title)}"><span class="item-name">${icon(item.type === "folder" ? "folder" : "file")}<span>${escapeHtml(item.title)}</span></span></td>
+    <td><span class="type-badge ${item.type === "folder" ? "folder" : "file"}">${item.type === "folder" ? "目录" : "文件"}</span></td>
+    <td title="${escapeAttribute(item.path)}">${escapeHtml(item.path)}</td>
+    <td><button class="link-copy" type="button" data-copy="${escapeAttribute(item.shareLink)}">复制链接</button><a class="link-cell" href="${escapeAttribute(safeLink(item.shareLink))}" target="_blank" rel="noreferrer">打开 ↗</a></td>
+    <td class="fid-cell" title="${escapeAttribute(item.fid)}">${escapeHtml(item.fid)}</td></tr>`,
+    );
+  elements.resultRows.innerHTML = [...failureRows, ...successRows].join("");
 }
 
-function renderEmptyResult() {
-  elements.resultRows.innerHTML = `
-    <tr class="empty-row">
-      <td colspan="5">
-        <strong>暂无索引结果</strong>
-        <span>请输入分享链接或导入 CSV 文件后开始生成索引。</span>
-      </td>
-    </tr>
-  `;
+function renderEmptyResult(
+  title = "还没有采集结果",
+  description = "添加分享链接并开始采集，结果会显示在这里。",
+) {
+  elements.resultRows.innerHTML = `<tr class="empty-row"><td colspan="5">${icon("tray")}<strong>${escapeHtml(title)}</strong><span>${escapeHtml(description)}</span></td></tr>`;
 }
 
 function renderPreviewRows(wrapper, container, links) {
@@ -696,41 +841,81 @@ function renderPreviewRows(wrapper, container, links) {
     return;
   }
 
-  container.innerHTML = links.slice(0, 20).map((link, index) => `
+  container.innerHTML =
+    links
+      .slice(0, 20)
+      .map(
+        (link, index) => `
     <div class="preview-row">
       <span>${index + 1}</span>
       <strong title="${escapeAttribute(link)}">${escapeHtml(link)}</strong>
       <em>待处理</em>
     </div>
-  `).join("");
+  `,
+      )
+      .join("") +
+    (links.length > 20
+      ? `<div class="preview-overflow">共 ${links.length} 个链接，预览前 20 个；采集时会处理全部链接。</div>`
+      : "");
 }
 
 async function retryFailedLinks() {
-  const payload = formPayload({ confirmAuthorized: true });
+  const payload = formPayload();
+  setActiveView("index", false);
   const links = state.failedLinks.map((item) => item.shareUrl).filter(Boolean);
   await collectLinks(payload, links, "失败项");
 }
 
 async function refreshLibrary() {
-  const stats = await api("/api/indexes/stats");
-  elements.metricStored.textContent = stats.total;
-  await searchLibrary();
+  elements.refreshLibrary.disabled = true;
+  elements.refreshLibrary.classList.add("loading");
+  try {
+    const stats = await api("/api/indexes/stats");
+    elements.metricStored.textContent = formatNumber(stats.total);
+    elements.navLibraryCount.textContent = compactNumber(stats.total);
+    elements.libraryFolders.textContent = formatNumber(stats.folders);
+    elements.libraryFiles.textContent = formatNumber(stats.files);
+    await searchLibrary();
+  } catch (error) {
+    renderLibraryError(error.message);
+  } finally {
+    elements.refreshLibrary.disabled = false;
+    elements.refreshLibrary.classList.remove("loading");
+  }
 }
 
 async function searchLibrary() {
+  const sequence = ++state.searchSequence;
   const query = elements.searchInput.value.trim();
   state.lastSearchQuery = query;
-  const params = new URLSearchParams({
-    q: query,
-    limit: "20",
-  });
-  const result = await api(`/api/indexes/search?${params.toString()}`);
-  renderSavedRows(result.items, result.total, result);
+  elements.libraryResultsTitle.textContent = query ? "搜索结果" : "全部资源";
+  elements.libraryResultsMeta.textContent = "正在查找…";
+  elements.searchButton.disabled = true;
+  elements.savedRows.setAttribute("aria-busy", "true");
+  renderLibraryLoading();
+  try {
+    const params = new URLSearchParams({ q: query, limit: "50" });
+    const result = await api(`/api/indexes/search?${params}`);
+    if (sequence !== state.searchSequence) return;
+    renderSavedRows(result.items, result.total, result);
+  } catch (error) {
+    if (sequence === state.searchSequence) renderLibraryError(error.message);
+  } finally {
+    if (sequence === state.searchSequence) {
+      elements.searchButton.disabled = false;
+      elements.savedRows.setAttribute("aria-busy", "false");
+    }
+  }
 }
 
 async function startInvalidCleanup() {
   const query = elements.searchInput.value.trim();
-  if (!query && !window.confirm("将校验整个索引库：夸克使用 10 并发，阿里保持低速；空目录或失效文件索引会被删除。确认开始吗？")) {
+  const scope = query ? `关键词「${query}」匹配的资源` : "整个资源库";
+  if (
+    !window.confirm(
+      `将校验${scope}，并删除失效文件或空目录的索引。确认开始清理吗？`,
+    )
+  ) {
     return;
   }
 
@@ -792,89 +977,114 @@ function renderCleanupStatus(status) {
     return;
   }
 
-  const percent = status.total ? Math.round((status.completed / status.total) * 100) : 0;
-  const statusText = {
-    running: "正在清理无效索引",
-    completed: "无效索引清理完成",
-    failed: "无效索引清理失败",
-  }[status.status] || "清理状态";
+  const percent = status.total
+    ? Math.round((status.completed / status.total) * 100)
+    : 0;
+  const statusText =
+    {
+      running: "正在清理无效索引",
+      completed: "无效索引清理完成",
+      failed: "无效索引清理失败",
+    }[status.status] || "清理状态";
 
   elements.cleanupProgressText.textContent = statusText;
-  elements.cleanupProgressMeta.textContent =
-    `已完成 ${status.completed} / ${status.total}，运行中 ${status.active || 0}，保留 ${status.valid}，删除 ${status.deleted}，跳过 ${status.skipped}，失败 ${status.failed}`;
+  elements.cleanupProgressMeta.textContent = `已完成 ${status.completed} / ${status.total}，运行中 ${status.active || 0}，保留 ${status.valid}，删除 ${status.deleted}，跳过 ${status.skipped}，失败 ${status.failed}`;
   elements.cleanupProgressBar.style.width = `${Math.max(0, Math.min(percent, 100))}%`;
+  elements.cleanupProgressBar.parentElement.setAttribute(
+    "aria-valuenow",
+    String(percent),
+  );
   elements.cleanupRecent.innerHTML = renderCleanupRecent(status);
 }
 
 function renderCleanupRecent(status) {
-  const currentItems = Array.isArray(status.current) ? status.current : (status.current ? [status.current] : []);
-  const current = currentItems.map((item) => `
+  const currentItems = Array.isArray(status.current)
+    ? status.current
+    : status.current
+      ? [status.current]
+      : [];
+  const current = currentItems
+    .map(
+      (item) => `
     <div class="cleanup-row active">
       <strong>处理中</strong>
       <span>${escapeHtml(item.title || item.path || item.id)}</span>
       <em>${escapeHtml(item.providerId || "")}</em>
     </div>
-  `).join("");
-  const recent = (status.recent || []).map((item) => `
+  `,
+    )
+    .join("");
+  const recent = (status.recent || [])
+    .map(
+      (item) => `
     <div class="cleanup-row ${item.action}">
       <strong>${cleanupActionLabel(item.action)}</strong>
       <span title="${escapeAttribute(item.reason || "")}">${escapeHtml(item.title || item.shareLink || item.id)}</span>
       <em>${escapeHtml(item.reason || "")}</em>
     </div>
-  `).join("");
+  `,
+    )
+    .join("");
 
   return current || recent ? `${current}${recent}` : "";
 }
 
 function cleanupActionLabel(action) {
-  return {
-    kept: "保留",
-    deleted: "删除",
-    skipped: "跳过",
-    failed: "失败",
-    not_found: "未找到",
-  }[action] || action || "-";
+  return (
+    {
+      kept: "保留",
+      deleted: "删除",
+      skipped: "跳过",
+      failed: "失败",
+      not_found: "未找到",
+    }[action] ||
+    action ||
+    "-"
+  );
 }
 
 function renderSavedRows(items, total, meta = {}) {
+  const summary =
+    meta.collapsed && meta.rawTotal > total
+      ? `${formatNumber(total)} 个入口 · 合并 ${formatNumber(meta.rawTotal)} 条明细`
+      : `${formatNumber(total)} 条资源${total > items.length ? ` · 显示前 ${items.length} 条` : ""}`;
+  elements.libraryResultsMeta.textContent = summary;
   if (!items.length) {
-    elements.savedRows.innerHTML = `<div class="empty-state">暂无匹配索引</div>`;
+    const query = state.lastSearchQuery;
+    elements.savedRows.innerHTML = `<div class="empty-state">${icon(query ? "magnifying-glass" : "tray")}
+      <strong>${query ? "没有找到相关资源" : "从第一个分享链接开始"}</strong>
+      <p>${query ? `未找到与「${escapeHtml(query)}」相关的索引，试试更短的关键词。` : "采集网盘分享链接，将目录保存到资源库，之后就能在这里搜索。"}</p>
+      <button class="ghost-button" type="button" ${query ? "data-search-clear" : 'data-go-view="index"'}>${query ? "查看全部资源" : "采集第一个资源"}${icon("arrow-right")}</button></div>`;
     return;
   }
-
-  const summary = meta.collapsed && meta.rawTotal > total
-    ? `匹配 ${meta.rawTotal} 条明细，折叠为 ${total} 个入口，显示前 ${items.length} 个`
-    : `匹配 ${total} 条，显示前 ${items.length} 条`;
-
   elements.savedRows.innerHTML = `
-    <div class="mini-summary">${summary}</div>
-    ${items.map((item) => `
-      <div class="mini-entry">
-        <button class="mini-item" type="button" data-entry-link="${escapeAttribute(item.shareLink)}" aria-expanded="false">
-          <strong title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</strong>
-          <span>${escapeHtml(item.type)} · ${escapeHtml(item.path)}</span>
+    <div class="library-columns" aria-hidden="true"><span>资源名称 / 所在路径</span><span>数据源</span><span>类型</span><span>操作</span></div>
+    ${items
+      .map(
+        (item) => `
+      <article class="mini-entry">
+        <button class="mini-item" type="button" data-entry-link="${escapeAttribute(item.shareLink)}" aria-expanded="false" aria-label="展开 ${escapeAttribute(item.title)} 的子项">
+          <span class="resource-icon ${item.type === "folder" ? "folder" : "file"}">${icon(item.type === "folder" ? "folder" : "file")}</span>
+          <span class="resource-copy"><strong title="${escapeAttribute(item.title)}">${escapeHtml(item.title)}</strong><span title="${escapeAttribute(item.path)}">${escapeHtml(providerLabel(item.providerId))} · ${escapeHtml(item.path || "/")}</span></span>
+          ${icon("caret-right", "icon entry-chevron")}
         </button>
-        <div class="mini-entry-actions">
-          <a class="ghost-link" href="${escapeAttribute(item.shareLink)}" target="_blank" rel="noreferrer">打开入口</a>
-          <button class="text-button" type="button" data-copy="${escapeAttribute(item.shareLink)}">复制链接</button>
-        </div>
+        <span class="provider-label">${escapeHtml(providerLabel(item.providerId))}</span>
+        <span class="type-badge ${item.type === "folder" ? "folder" : "file"}">${item.type === "folder" ? "目录" : "文件"}</span>
+        <div class="mini-entry-actions"><a class="ghost-link" href="${escapeAttribute(safeLink(item.shareLink))}" target="_blank" rel="noreferrer" aria-label="打开 ${escapeAttribute(item.title)} 的分享入口">打开入口${icon("arrow-up-right")}</a><button class="copy-button" type="button" data-copy="${escapeAttribute(item.shareLink)}" title="复制链接" aria-label="复制 ${escapeAttribute(item.title)} 的分享链接">${icon("copy")}</button></div>
         <div class="mini-children" hidden></div>
-      </div>
-    `).join("")}
-  `;
-
-  elements.savedRows.querySelectorAll("[data-entry-link]").forEach((button) => {
-    button.addEventListener("click", () => toggleSavedEntry(button));
-  });
-  elements.savedRows.querySelectorAll("[data-copy]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(button.dataset.copy);
-      button.textContent = "已复制";
-      setTimeout(() => {
-        button.textContent = "复制链接";
-      }, 1200);
+      </article>`,
+      )
+      .join("")}`;
+  elements.savedRows
+    .querySelectorAll("[data-entry-link]")
+    .forEach((button, index) => {
+      const children = button
+        .closest(".mini-entry")
+        .querySelector(".mini-children");
+      children.id = `entry-children-${index}`;
+      button.setAttribute("aria-controls", children.id);
+      button.addEventListener("click", () => toggleSavedEntry(button));
     });
-  });
 }
 
 async function toggleSavedEntry(button) {
@@ -922,21 +1132,30 @@ function renderEntryChildren(items, result) {
 
   return `
     <div class="mini-child-summary">显示 ${items.length} / ${result.matchedTotal} 个命中子项，入口下共 ${result.total} 个已索引子项。</div>
-    ${items.map((item) => `
+    ${items
+      .map(
+        (item) => `
       <div class="mini-child matched">
         <span class="child-type">${item.type === "folder" ? "目录" : "文件"}</span>
         <strong title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</strong>
         <span title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>
         <em>命中</em>
       </div>
-    `).join("")}
+    `,
+      )
+      .join("")}
   `;
 }
 
 function updatePermissionState() {
-  elements.collectButton.disabled = !elements.confirmAuthorized.checked;
-  elements.batchCollectButton.disabled = !elements.confirmAuthorized.checked;
-  elements.csvCollectButton.disabled = !elements.confirmAuthorized.checked || !state.csvLinks.length;
+  elements.collectButton.disabled =
+    state.isBusy || !elements.confirmAuthorized.checked;
+  elements.batchCollectButton.disabled =
+    state.isBusy || !elements.confirmAuthorized.checked;
+  elements.csvCollectButton.disabled =
+    state.isBusy ||
+    !elements.confirmAuthorized.checked ||
+    !state.csvLinks.length;
   elements.permissionHint.hidden = elements.confirmAuthorized.checked;
   elements.batchPermissionHint.hidden = elements.confirmAuthorized.checked;
 }
@@ -978,29 +1197,26 @@ function setPrimaryLoading(mode, loading) {
     csv: elements.csvCollectButton,
   };
   const labels = {
-    single: "开始解析并生成索引",
-    batch: "批量解析并生成索引",
-    csv: "从 CSV 生成索引",
+    single: "开始采集",
+    batch: "开始批量采集",
+    csv: "开始导入",
   };
   const button = map[mode];
   if (!button) return;
   button.classList.toggle("loading", loading);
-  button.textContent = loading ? "正在解析…" : labels[mode];
+  button.innerHTML = loading
+    ? "正在采集…"
+    : `${labels[mode]}${icon("arrow-right")}`;
 }
 
 function startProgress(stages) {
-  let index = 0;
   clearInterval(state.progressTimer);
   elements.progressPanel.hidden = false;
+  elements.taskProgressBar.style.width = "";
+  elements.taskProgressBar.parentElement.classList.add("indeterminate");
   elements.progressText.textContent = stages[0] || "正在处理";
-  elements.progressMeta.textContent = "当前处理链接：- · 已发现目录 0 · 已发现文件 0 · 当前递归深度 -";
-
-  if (stages.length > 1) {
-    state.progressTimer = setInterval(() => {
-      index = (index + 1) % stages.length;
-      elements.progressText.textContent = stages[index];
-    }, 1100);
-  }
+  elements.progressMeta.textContent =
+    "当前处理链接：- · 已发现目录 0 · 已发现文件 0 · 当前递归深度 -";
 }
 
 function stopProgress() {
@@ -1010,18 +1226,26 @@ function stopProgress() {
 }
 
 function currentProviderName() {
-  return state.providers.find((provider) => provider.id === state.providerId)?.displayName || state.providerId;
+  return (
+    state.providers.find((provider) => provider.id === state.providerId)
+      ?.displayName || state.providerId
+  );
 }
 
 function currentProviderLimits() {
-  return state.providers.find((provider) => provider.id === state.providerId)?.limits || {};
+  return (
+    state.providers.find((provider) => provider.id === state.providerId)
+      ?.limits || {}
+  );
 }
 
 function currentProviderCopy() {
-  return PROVIDER_COPY[state.providerId] || {
-    example: "https://example.com/s/xxxx",
-    label: "分享链接",
-  };
+  return (
+    PROVIDER_COPY[state.providerId] || {
+      example: "https://example.com/s/xxxx",
+      label: "分享链接",
+    }
+  );
 }
 
 function summarizeItems(items) {
@@ -1036,6 +1260,7 @@ function summarizeItems(items) {
 function setSegment(selector, activeButton) {
   document.querySelectorAll(selector).forEach((button) => {
     button.classList.toggle("active", button === activeButton);
+    button.setAttribute("aria-pressed", String(button === activeButton));
   });
 }
 
@@ -1051,9 +1276,10 @@ function getBatchConcurrency() {
 function downloadResult(format) {
   if (!state.lastResult) return;
   const filename = `video-collect-${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`;
-  const content = format === "json"
-    ? JSON.stringify(state.lastResult, null, 2)
-    : toCsv(state.lastResult.items);
+  const content =
+    format === "json"
+      ? JSON.stringify(state.lastResult, null, 2)
+      : toCsv(state.lastResult.items);
   const type = format === "json" ? "application/json" : "text/csv";
 
   const blob = new Blob([content], { type: `${type};charset=utf-8` });
@@ -1069,7 +1295,9 @@ function downloadResult(format) {
 
 async function api(path, options = {}) {
   const controller = new AbortController();
-  state.activeControllers.add(controller);
+  const taskRequest =
+    path === "/api/index/export" || path === "/api/indexes/save";
+  if (taskRequest) state.activeControllers.add(controller);
   try {
     const response = await fetch(path, {
       method: options.method || "GET",
@@ -1105,6 +1333,7 @@ function setBusy(button, isBusy) {
 }
 
 function setFormBusy(isBusy) {
+  state.isBusy = isBusy;
   elements.collectorForm
     .querySelectorAll("button, input, textarea")
     .forEach((element) => {
@@ -1138,7 +1367,9 @@ function toCsv(rows) {
   ];
   return [
     columns.join(","),
-    ...rows.map((row) => columns.map((column) => csvCell(row[column])).join(",")),
+    ...rows.map((row) =>
+      columns.map((column) => csvCell(row[column])).join(","),
+    ),
   ].join("\n");
 }
 
@@ -1162,4 +1393,88 @@ function escapeHtml(value) {
 
 function escapeAttribute(value) {
   return escapeHtml(value).replace(/`/g, "&#096;");
+}
+
+function icon(name, className = "icon") {
+  return `<svg class="${className}" aria-hidden="true"><use href="/icons.svg#${name}" /></svg>`;
+}
+
+function providerLabel(id) {
+  return (
+    { "quark-share": "夸克网盘", "aliyun-share": "阿里云盘" }[id] ||
+    state.providers.find((provider) => provider.id === id)?.displayName ||
+    "其他来源"
+  );
+}
+
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function compactNumber(value) {
+  return Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(Number(value || 0));
+}
+
+function safeLink(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "https:" || url.protocol === "http:") return url.href;
+  } catch {
+    /* Invalid resource links must not execute code. */
+  }
+  return "about:blank";
+}
+
+function renderLibraryLoading() {
+  elements.savedRows.innerHTML = `<div class="library-loading" aria-label="正在读取资源">${Array.from({ length: 3 }, () => `<div class="skeleton-row"><span class="skeleton-icon"></span><span class="skeleton-copy"><span class="skeleton-line"></span><span class="skeleton-line short"></span></span></div>`).join("")}</div>`;
+}
+
+function renderLibraryError(message) {
+  elements.libraryResultsMeta.textContent = "读取失败";
+  elements.savedRows.innerHTML = `<div class="empty-state">${icon("warning-circle")}<strong>暂时无法读取资源库</strong><p>${escapeHtml(message)}</p><button class="ghost-button" type="button" data-search-retry>重新加载${icon("arrows-clockwise")}</button></div>`;
+}
+
+async function copyLink(button) {
+  const original = button.innerHTML;
+  const originalLabel = button.getAttribute("aria-label");
+  const originalTitle = button.getAttribute("title");
+  button.disabled = true;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(button.dataset.copy);
+    } else {
+      const field = document.createElement("textarea");
+      field.value = button.dataset.copy;
+      field.className = "clipboard-fallback";
+      document.body.append(field);
+      field.select();
+      const copied = document.execCommand("copy");
+      field.remove();
+      button.focus({ preventScroll: true });
+      if (!copied) throw new Error("复制失败");
+    }
+    button.innerHTML = button.classList.contains("copy-button")
+      ? icon("check")
+      : "已复制";
+    button.setAttribute("aria-label", "链接已复制");
+    button.setAttribute("title", "链接已复制");
+  } catch {
+    button.innerHTML = button.classList.contains("copy-button")
+      ? icon("warning-circle")
+      : "复制失败";
+    button.setAttribute("aria-label", "复制失败，请打开分享入口复制地址");
+    button.setAttribute("title", "复制失败，请打开分享入口复制地址");
+  } finally {
+    window.setTimeout(() => {
+      button.innerHTML = original;
+      if (originalLabel) button.setAttribute("aria-label", originalLabel);
+      else button.removeAttribute("aria-label");
+      if (originalTitle) button.setAttribute("title", originalTitle);
+      else button.removeAttribute("title");
+      button.disabled = false;
+    }, 1600);
+  }
 }
